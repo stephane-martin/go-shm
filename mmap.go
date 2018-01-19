@@ -1,23 +1,12 @@
-// Copyright 2011 Evan Shaw. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
+// +build darwin dragonfly freebsd linux openbsd solaris netbsd
 
-// This file defines the common package interface and contains a little bit of
-// factored out logic.
-
-// Package mmap allows mapping files into memory. It tries to provide a simple, reasonably portable interface,
-// but doesn't go out of its way to abstract away every little platform detail.
-// This specifically means:
-//	* forked processes may or may not inherit mappings
-//	* a file's timestamp may or may not be updated by writes through mappings
-//	* specifying a size larger than the file's actual size can increase the file's size
-//	* If the mapped file is being modified by another process while your program's running, don't expect consistent results between platforms
-package mmap
+package shm
 
 import (
 	"errors"
 	"os"
 	"reflect"
+	"syscall"
 	"unsafe"
 )
 
@@ -40,19 +29,67 @@ const (
 	ANON = 1 << iota
 )
 
-// MMap represents a file mapped into memory.
-type MMap []byte
+const _SYS_MSYNC = syscall.SYS_MSYNC
+const _MS_SYNC = syscall.MS_SYNC
 
-// Map maps an entire file into memory.
-// If ANON is set in flags, f is ignored.
-func Map(f *os.File, prot, flags int) (MMap, error) {
-	return MapRegion(f, -1, prot, flags, 0)
+func mmap(len int, inprot, inflags, fd uintptr, off int64) ([]byte, error) {
+	flags := syscall.MAP_SHARED
+	prot := syscall.PROT_READ
+	switch {
+	case inprot&COPY != 0:
+		prot |= syscall.PROT_WRITE
+		flags = syscall.MAP_PRIVATE
+	case inprot&RDWR != 0:
+		prot |= syscall.PROT_WRITE
+	}
+	if inprot&EXEC != 0 {
+		prot |= syscall.PROT_EXEC
+	}
+	if inflags&ANON != 0 {
+		flags |= syscall.MAP_ANON
+	}
+
+	b, err := syscall.Mmap(int(fd), off, len, prot, flags)
+	if err != nil {
+		return nil, err
+	}
+	return b, nil
 }
 
-// MapRegion maps part of a file into memory.
-// The offset parameter must be a multiple of the system's page size.
-// If length < 0, the entire file will be mapped.
-// If ANON is set in flags, f is ignored.
+func flush(addr, len uintptr) error {
+	_, _, errno := syscall.Syscall(_SYS_MSYNC, addr, len, _MS_SYNC)
+	if errno != 0 {
+		return syscall.Errno(errno)
+	}
+	return nil
+}
+
+func lock(addr, len uintptr) error {
+	_, _, errno := syscall.Syscall(syscall.SYS_MLOCK, addr, len, 0)
+	if errno != 0 {
+		return syscall.Errno(errno)
+	}
+	return nil
+}
+
+func unlock(addr, len uintptr) error {
+	_, _, errno := syscall.Syscall(syscall.SYS_MUNLOCK, addr, len, 0)
+	if errno != 0 {
+		return syscall.Errno(errno)
+	}
+	return nil
+}
+
+func unmap(addr, len uintptr) error {
+	_, _, errno := syscall.Syscall(syscall.SYS_MUNMAP, addr, len, 0)
+	if errno != 0 {
+		return syscall.Errno(errno)
+	}
+	return nil
+}
+
+type MMap []byte
+
 func MapRegion(f *os.File, length int, prot, flags int, offset int64) (MMap, error) {
 	if offset%int64(os.Getpagesize()) != 0 {
 		return nil, errors.New("offset parameter must be a multiple of the system's page size")
